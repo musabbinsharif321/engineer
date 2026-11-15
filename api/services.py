@@ -1,10 +1,48 @@
 from decimal import Decimal
 import json
+from django.db.models import Sum
 from .models import Product, TransactionItem
+
+
+def _get_purchase_extra_per_unit(tx):
+    """
+    Extracts shipping + labor extra cost per unit from transaction notes JSON
+    when isLandedCostAuto is enabled.
+    """
+    if not tx or not tx.notes or not tx.notes.strip().startswith('{'):
+        return 0.0
+    try:
+        first_line = tx.notes.split('\n')[0]
+        meta = json.loads(first_line)
+        is_landed_auto = meta.get('isLandedCostAuto', True)
+        if is_landed_auto is not False and is_landed_auto != 'false' and is_landed_auto != 0:
+            ship = float(meta.get('shippingCost') or 0.0)
+            lab = float(meta.get('laborCost') or 0.0)
+            tot_extra = ship + lab
+            if tot_extra > 0:
+                tot_qty = float(tx.items.aggregate(total=Sum('quantity'))['total'] or 0)
+                if tot_qty > 0:
+                    return tot_extra / tot_qty
+    except Exception:
+        pass
+    return 0.0
+
+
+def _compute_weighted_average_cost(running_stock, running_price, qty, landed_price):
+    """
+    Computes weighted average purchase cost:
+    ((current_stock * current_avg_cost) + (new_qty * new_landed_cost)) / (current_stock + new_qty)
+    """
+    if landed_price <= 0:
+        return running_price
+    if running_stock > 0 and running_price > 0 and (running_stock + qty) > 0:
+        return ((running_stock * running_price) + (qty * landed_price)) / (running_stock + qty)
+    return landed_price
+
 
 def recalculate_product_stock_and_cost(product_or_id):
     """
-    Chronologically recalculates stock and sets the latest purchase price
+    Chronologically recalculates stock and weighted average purchase price
     for a given product from all its historical transactions.
     """
     if not product_or_id:
@@ -45,8 +83,11 @@ def recalculate_product_stock_and_cost(product_or_id):
         unit_price = float(item.price or 0)
 
         if tx_type == 'purchase':
-            if unit_price > 0:
-                running_purchase_price = unit_price
+            extra_per_unit = _get_purchase_extra_per_unit(tx)
+            landed_price = unit_price + extra_per_unit
+            running_purchase_price = _compute_weighted_average_cost(
+                running_stock, running_purchase_price, qty, landed_price
+            )
             running_stock += qty
 
         elif tx_type == 'sale':
@@ -132,9 +173,22 @@ def generate_product_cost_log(product_or_id):
         extra_per_unit = 0.0
 
         if tx_type == 'purchase':
-            if unit_price > 0:
-                running_purchase_price = unit_price
-                formula = f"নতুন ক্রয়মূল্য: ৳{round(unit_price, 2)}"
+            extra_per_unit = _get_purchase_extra_per_unit(tx)
+            landed_price = unit_price + extra_per_unit
+            running_purchase_price = _compute_weighted_average_cost(
+                stock_before, cost_before, qty, landed_price
+            )
+            if stock_before > 0 and cost_before > 0 and (stock_before + qty) > 0 and landed_price > 0:
+                formula = (
+                    f"(({round(stock_before, 2)} × ৳{round(cost_before, 2)}) + "
+                    f"({round(qty, 2)} × ৳{round(landed_price, 2)})) ÷ "
+                    f"{round(stock_before + qty, 2)} = ৳{round(running_purchase_price, 2)}"
+                )
+            elif landed_price > 0:
+                if extra_per_unit > 0:
+                    formula = f"নতুন গড় ক্রয়মূল্য: ৳{round(unit_price, 2)} + খরচ ৳{round(extra_per_unit, 2)} = ৳{round(landed_price, 2)}"
+                else:
+                    formula = f"নতুন গড় ক্রয়মূল্য: ৳{round(landed_price, 2)}"
             else:
                 formula = f"ক্রয়: +{round(qty, 2)} {product.unit}"
 

@@ -24,6 +24,7 @@ class Party(models.Model):
         ('customer', 'Customer'),
         ('supplier', 'Supplier'),
         ('engineer', 'Engineer'),
+        ('partner', 'Partner'),
         ('both', 'Both'),
     ]
 
