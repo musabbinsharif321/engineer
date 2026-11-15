@@ -722,6 +722,49 @@ class TransactionSerializer(serializers.ModelSerializer):
                         'paid_amount': f"পর্যাপ্ত নগদ ক্যাশ ব্যালেন্স নেই! (বর্তমান ক্যাশ ব্যালেন্স: ৳ {cash_bal:,.2f}, মোট নগদ পরিশোধ করতে চাচ্ছেন: ৳ {total_cash_needed:,.2f} [{breakdown}])। ক্যাশে পর্যাপ্ত ব্যালেন্স না থাকলে নগদ প্রদান বা গাড়ি ভাড়া/লেবার পরিশোধ করা যাবে না।"
                     })
 
+        # Stock availability validation for sales: prevent selling more than available stock
+        effective_status = attrs.get('status') or (self.instance.status if self.instance else 'completed')
+        effective_notes = attrs.get('notes') if 'notes' in attrs else (self.instance.notes if self.instance else '')
+        is_historical_sale = 'isHistoricalLedger' in (effective_notes or '')
+        if tx_type == 'sale' and effective_status not in ['draft', 'cancelled', 'rejected'] and not is_historical_sale:
+            old_qty_by_prod = {}
+            if self.instance and self.instance.transaction_type == 'sale' and self.instance.status not in ['pending', 'draft', 'cancelled', 'rejected']:
+                for old_item in self.instance.items.all():
+                    old_prod = old_item.product
+                    if not old_prod and old_item.product_name:
+                        old_prod = Product.objects.filter(name__iexact=old_item.product_name.strip()).first()
+                    if old_prod:
+                        old_qty_by_prod[old_prod.id] = old_qty_by_prod.get(old_prod.id, Decimal('0')) + Decimal(str(old_item.quantity or 0))
+
+            requested_by_prod = {}
+            prod_map = {}
+            if 'items' in attrs:
+                for item in attrs['items']:
+                    prod = item.get('product')
+                    if not prod and item.get('product_name'):
+                        prod = Product.objects.filter(name__iexact=str(item.get('product_name')).strip()).first()
+                    if prod:
+                        qty = Decimal(str(item.get('quantity') or 0))
+                        requested_by_prod[prod.id] = requested_by_prod.get(prod.id, Decimal('0')) + qty
+                        prod_map[prod.id] = prod
+            elif self.instance:
+                for item in self.instance.items.all():
+                    prod = item.product
+                    if not prod and item.product_name:
+                        prod = Product.objects.filter(name__iexact=item.product_name.strip()).first()
+                    if prod:
+                        qty = Decimal(str(item.quantity or 0))
+                        requested_by_prod[prod.id] = requested_by_prod.get(prod.id, Decimal('0')) + qty
+                        prod_map[prod.id] = prod
+
+            for pid, req_qty in requested_by_prod.items():
+                prod = prod_map[pid]
+                avail_stock = Decimal(str(prod.stock or 0)) + old_qty_by_prod.get(pid, Decimal('0'))
+                if req_qty > avail_stock + Decimal('0.001'):
+                    raise serializers.ValidationError({
+                        'items': f"স্টকে পর্যাপ্ত পণ্য নেই! '{prod.name}'-এর বর্তমান স্টক: {float(avail_stock):g} {prod.unit}, কিন্তু বিক্রয় করতে চাচ্ছেন: {float(req_qty):g} {prod.unit}। স্টকের চেয়ে বেশি বিক্রয় করা যাবে না।"
+                    })
+
         return attrs
 
     def create(self, validated_data):
